@@ -1,0 +1,241 @@
+version: "3.9"
+
+# =============================================================================
+# 이벤트 로그 파이프라인 전체 스택
+#
+# 기동 순서:
+#   postgres, influxdb, minio (인프라)
+#     → telegraf (influxdb 준비 후)
+#     → app / grafana (postgres + telegraf 준비 후)
+#     → generator (app 준비 후 이벤트 대량 생성)
+#
+# 실행:
+#   docker compose up --build
+#
+# 접속:
+#   FastAPI   http://localhost:8000
+#   Grafana   http://localhost:3000  (admin / admin)
+#   InfluxDB  http://localhost:8086
+#   MinIO     http://localhost:9001  (minioadmin / minioadmin)
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — 유저/인증 데이터 전용 (AWS: RDS로 교체)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: pipeline-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-events_db}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"   # BastionHost 환경에서는 이 포트 노출 제거
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin} -d ${POSTGRES_DB:-events_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - pipeline-net
+
+  # ---------------------------------------------------------------------------
+  # InfluxDB — 이벤트 로그 시계열 저장소 (AWS: EC2에 직접 설치)
+  # ---------------------------------------------------------------------------
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: pipeline-influxdb
+    restart: unless-stopped
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_ADMIN_USER:-admin}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_ADMIN_PASSWORD:-adminpassword}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG:-myorg}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_BUCKET:-events}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN:-my-super-secret-token}
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    ports:
+      - "8086:8086"   # BastionHost 환경에서는 이 포트 노출 제거
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - pipeline-net
+
+  # ---------------------------------------------------------------------------
+  # Telegraf — 이벤트 수집 에이전트
+  # FastAPI → HTTP POST → Telegraf → InfluxDB
+  # ---------------------------------------------------------------------------
+  telegraf:
+    image: telegraf:1.30-alpine
+    container_name: pipeline-telegraf
+    restart: unless-stopped
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    environment:
+      INFLUXDB_URL: ${INFLUXDB_URL:-http://influxdb:8086}
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-my-super-secret-token}
+      INFLUXDB_ORG: ${INFLUXDB_ORG:-myorg}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET:-events}
+    volumes:
+      - ./telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+    ports:
+      - "8186:8186"   # http_listener_v2 수신 포트 (앱 내부 통신)
+    networks:
+      - pipeline-net
+
+  # ---------------------------------------------------------------------------
+  # MinIO — S3 호환 오브젝트 스토리지 (AWS: S3로 교체 + endpoint_url 제거)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: pipeline-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"   # API 엔드포인트 (boto3 endpoint_url)
+      - "9001:9001"   # 웹 콘솔
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - pipeline-net
+
+  # ---------------------------------------------------------------------------
+  # MinIO 초기화 — 버킷 자동 생성 (일회성 실행)
+  # ---------------------------------------------------------------------------
+  minio-init:
+    image: minio/mc:latest
+    container_name: pipeline-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 ${AWS_ACCESS_KEY_ID:-minioadmin} ${AWS_SECRET_ACCESS_KEY:-minioadmin};
+        mc mb --ignore-existing local/${S3_BUCKET:-event-logs};
+        echo 'MinIO bucket ready: ${S3_BUCKET:-event-logs}';
+      "
+    networks:
+      - pipeline-net
+
+  # ---------------------------------------------------------------------------
+  # FastAPI 웹앱 — 로그인 페이지 + 이벤트 emit
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: pipeline-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      telegraf:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      LOCAL: "true"
+      POSTGRES_HOST: postgres
+      TELEGRAF_URL: http://telegraf:8186/telegraf
+      MINIO_ENDPOINT: http://minio:9000
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - pipeline-net
+
+  # ---------------------------------------------------------------------------
+  # Generator — 랜덤 이벤트 대량 생성 (app 기동 후 1회 실행)
+  # ---------------------------------------------------------------------------
+  generator:
+    build:
+      context: ./generator
+      dockerfile: Dockerfile
+    container_name: pipeline-generator
+    restart: "no"                 # 1회 실행 후 종료
+    depends_on:
+      app:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      APP_URL: http://app:8000
+      EVENT_COUNT: ${EVENT_COUNT:-1000}
+    networks:
+      - pipeline-net
+
+  # ---------------------------------------------------------------------------
+  # Grafana — 시각화 대시보드 (datasource + dashboard 자동 프로비저닝)
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: pipeline-grafana
+    restart: unless-stopped
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Grafana → InfluxDB 연결 정보 (provisioning에서 참조)
+      INFLUXDB_URL: ${INFLUXDB_URL:-http://influxdb:8086}
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-my-super-secret-token}
+      INFLUXDB_ORG: ${INFLUXDB_ORG:-myorg}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET:-events}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    networks:
+      - pipeline-net
+
+# =============================================================================
+# Volumes — 데이터 영속성
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  influxdb_data:
+    driver: local
+  minio_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  pipeline-net:
+    driver: bridge
